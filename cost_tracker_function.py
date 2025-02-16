@@ -1,10 +1,10 @@
 """
-title: Cost Tracker for Open WebUI
+title: Cost Tracker
 description: This function is designed to manage and calculate the costs associated with user interactions and model usage in a Open WebUI.
-author: bgeneto
-author_url: https://github.com/bgeneto/open-webui-cost-tracker
+author: Bernhard and kcode
+author_url: https://github.com/bgeneto/open-webui-cost-tracker and https://github.com/kcdlr/open-webui-cost-tracker
 funding_url: https://github.com/open-webui
-version: 0.3.0
+version: 0.2.2
 license: MIT
 requirements: requests, tiktoken, cachetools, pydantic
 environment_variables:
@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import time
+import re
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from threading import Lock
@@ -27,21 +28,17 @@ import tiktoken
 from cachetools import TTLCache, cached
 from open_webui.utils.misc import get_last_assistant_message, get_messages_content
 from pydantic import BaseModel, Field
-from rapidfuzz import fuzz
 
 
 class Config:
     DATA_DIR = "data"
     CACHE_DIR = os.path.join(DATA_DIR, ".cache")
-    USER_COST_FILE = os.path.join(
-        DATA_DIR,
-        f"costs-{datetime.now().year:04d}-{datetime.now().month:02d}.json"
-    )
+    USER_COST_FILE = os.path.join(DATA_DIR, f"costs-{datetime.now().year}.json")
     CACHE_TTL = 432000  # try to keep model pricing json file for 5 days in the cache.
     CACHE_MAXSIZE = 16
     DECIMALS = "0.00000001"
-    DEBUG_PREFIX = "DEBUG:    " + __name__.upper() + " -"
-    INFO_PREFIX = "INFO:     " + __name__.upper() + " -"
+    DEBUG_PREFIX = "DEBUG:    " + __name__ + " -"
+    INFO_PREFIX = "INFO:     " + __name__ + " -"
     DEBUG = False
 
 
@@ -79,33 +76,30 @@ class UserCostManager:
             json.dump(costs, cost_file, indent=4)
 
     def update_user_cost(
-            self,
-            user_email: str,
-            model: str,
-            input_tokens: int,
-            output_tokens: int,
-            total_cost: Decimal,
-        ):
-            costs = self._read_costs()
-            timestamp = datetime.now().isoformat()
+        self,
+        user_email: str,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        total_cost: Decimal,
+    ):
+        costs = self._read_costs()
+        timestamp = datetime.now().isoformat()
 
-            # Ensure costs is a list
-            if not isinstance(costs, list):
-                costs = []
+        if user_email not in costs:
+            costs[user_email] = []
 
-            # Add new usage record directly to list
-            costs.append(
-                {
-                    "user": user_email,
-                    "model": model,
-                    "timestamp": timestamp,
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "total_cost": str(total_cost),
-                }
-            )
+        costs[user_email].append(
+            {
+                "model": model,
+                "timestamp": timestamp,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_cost": str(total_cost),
+            }
+        )
 
-            self._write_costs(costs)
+        self._write_costs(costs)
 
 
 class ModelCostManager:
@@ -213,6 +207,31 @@ class ModelCostManager:
 
         return dp[m][n]
 
+    def get_latest_model(self, model_key, models):
+        if model_key.startswith("anthropic."):
+            model_key = model_key.replace("anthropic.", "")
+
+        if model_key.endswith("-latest"):
+            prefix = (
+                model_key.rsplit("-", 1)[0] + "-"
+            )  # "-latest" を削除し、接頭辞を取得
+        else:
+            return None  # "-latest" で終わらない場合は None を返す
+
+        latest_model = None
+        latest_date = None
+        date_pattern = re.compile(rf"^{re.escape(prefix)}(\d{{8}})$")
+
+        for model_name in models:
+            match = date_pattern.match(model_name)
+            if match:
+                model_date = int(match.group(1))  # YYYYMMDD を整数化
+                if latest_date is None or model_date > latest_date:
+                    latest_date = model_date
+                    latest_model = model_name
+
+        return latest_model
+
     def _find_best_match(self, query: str, json_data) -> str:
         # Exact match search
         query_lower = query.lower()
@@ -221,19 +240,12 @@ class ModelCostManager:
         if query_lower in keys_lower:
             return keys_lower[query_lower]
 
-        # If no exact match is found, try fuzzy partial matching
-        start = time.time()
-        partial_ratios = [(fuzz.ratio(key, query_lower), key) for key in keys_lower]
-        best_match, best_key = max(partial_ratios, key=lambda x: x[0])
-        end = time.time()
-        if Config.DEBUG:
-            print(
-                f"{Config.DEBUG_PREFIX} Best fuzzy match for query '{query}' is '{best_key}' with ratio {best_match:.1f} in {end - start:.4f} seconds"
-            )
-        if best_match >= 79:
-            return best_key
+        latest_model = self.get_latest_model(query_lower, keys_lower)
 
-        # Fallback to Levenshtein distance matching as a last resort
+        if latest_model:
+            return keys_lower[latest_model]
+
+        # Fallback to Levenshtein distance matching if no exact match is found
         threshold_ratio = 0.6 if len(query) < 15 else 0.3
         min_distance = float("inf")
         best_match = None
@@ -250,25 +262,12 @@ class ModelCostManager:
         end = time.time()
         if Config.DEBUG:
             print(
-                f"{Config.DEBUG_PREFIX} Levenshtein min. distance was {min_distance}. Search took {end - start:.3f} seconds"
+                f"{Config.DEBUG_PREFIX} Levenshtein distance search took {end - start:.3f} seconds"
             )
+        if min_distance > threshold:
+            return None  # No match found within the threshold
 
-        if min_distance <= threshold:
-            return best_match
-
-        # Final fallback: try fuzz.partial_ratio
-        start = time.time()
-        partial_ratios = [(fuzz.partial_ratio(key, query_lower), key) for key in keys_lower]
-        best_ratio, best_key = max(partial_ratios, key=lambda x: x[0])
-        end = time.time()
-        if Config.DEBUG:
-            print(
-                f"{Config.DEBUG_PREFIX} Best partial ratio match for query '{query}' is '{best_key}' with ratio {best_ratio:.1f} in {end - start:.4f} seconds"
-            )
-        if best_ratio >= 80:  # Threshold for partial ratio
-            return best_key
-
-        return None
+        return best_match
 
     def get_model_data(self, model):
         json_data = self.get_cost_data()
@@ -326,6 +325,21 @@ class CostCalculator:
         return total_cost
 
 
+def get_exchange_rate(base_currency="USD", target_currency="JPY"):
+    url = f"https://api.frankfurter.app/latest?from={base_currency}"
+    print(f"---Fetching exchange rate from {url}")
+    response = requests.get(url)
+    print(f"---Response: {response.status_code}")
+
+    if response.status_code == 200:
+        data = response.json()
+        rates = data.get("rates", {})
+        if target_currency in rates:
+            return rates[target_currency]
+
+    return 150
+
+
 class Filter:
     class Valves(BaseModel):
         priority: int = Field(default=15, description="Priority level")
@@ -364,10 +378,9 @@ class Filter:
             str: sanitized model name
         """
         prefixes = [
-            "openai/",
-            "github/",
-            "google_genai/",
-            "deepseek/"
+            "openai",
+            "github",
+            "google_genai",
         ]
         suffixes = ["-tuned"]
         # remove prefixes and suffixes
@@ -474,18 +487,18 @@ class Filter:
         if __user__:
             if "email" in __user__:
                 user_email = __user__["email"]
-                try:
-                    self.user_cost_manager.update_user_cost(
-                        user_email,
-                        model,
-                        self.input_tokens,
-                        output_tokens,
-                        total_cost,
-                    )
-                except Exception as _:
-                    print("**ERROR: Unable to update user cost file!")
             else:
                 print("**ERROR: User email not found!")
+            try:
+                self.user_cost_manager.update_user_cost(
+                    user_email,
+                    model,
+                    self.input_tokens,
+                    output_tokens,
+                    total_cost,
+                )
+            except Exception as _:
+                print("**ERROR: Unable to update user cost file!")
         else:
             print("**ERROR: User not found!")
 
@@ -500,10 +513,11 @@ class Filter:
         if self.valves.number_of_tokens:
             stats_array.append(f"{tokens} Tokens")
 
-        if float(total_cost) < float(Config.DECIMALS):
-            stats_array.append(f"${total_cost:.2f}")
-        else:
-            stats_array.append(f"${total_cost:.6f}")
+        rate = get_exchange_rate()
+        formatted_number = (
+            "{:.10f}".format(float(total_cost) * rate).rstrip("0").rstrip(".")
+        )
+        stats_array.append(formatted_number + "円")
 
         stats = " | ".join(stats_array)
 
